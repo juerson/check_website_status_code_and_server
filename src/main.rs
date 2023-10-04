@@ -14,7 +14,7 @@ use csv::Writer;
 use std::fmt;
 use std::error::Error;
 
-//下面代码（一个struct、两个impl），主要用于处理无法在main函数中打印tcp_client_hello函数返回来的结果的问题
+//下面代码（一个struct、两个impl），主要用于处理无法在main函数中处理tcp_client_hello函数返回来的结果的问题
 #[derive(Debug)]
 struct CustomError(Box<dyn Error + Send>);
 
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 				// 将任务结果发送到通道
 				let send_result = sender_clone.send(result.map_err(|e| e.to_string())).await;
-				// 如果要在main函数中，要接收结果并使用它们，就必须添加下面这个用于处理"发送失败"时的代码。
+				// 如果要在main函数中，要接收结果并使用它们，就必须添加下面的代码(用于处理"发送失败")
 				if let Err(_err) = send_result {
 					// eprintln!("Failed to send result: {:?}", err);
 				}
@@ -111,7 +111,8 @@ fn read_and_parse_ips_from_file(filename: &str) -> Result<Vec<String>, Box<dyn s
     let file = File::open(filename);
 	let file_result = file.unwrap_or_else(|err| {
         // 处理文件不存在的错误
-        eprintln!("Error opening file: {}", err);
+        eprintln!("打开{}文件，报错: {}", filename, err);
+		wait_for_enter();
         std::process::exit(1); // 终止程序
     });
     let reader = BufReader::new(file_result);
@@ -131,7 +132,8 @@ fn read_and_parse_ips_from_file(filename: &str) -> Result<Vec<String>, Box<dyn s
 
     let ips: Vec<String> = unique_ips.into_iter().collect();
     if ips.is_empty() {
-        eprintln!("File '{}' is empty.", filename);
+        eprintln!("文件'{}'不能为空.", filename);
+		wait_for_enter();
         std::process::exit(1);
     }
 
@@ -171,7 +173,7 @@ async fn tcp_client_hello(ip: String, port: u16) -> Result<(String, u16, String,
     let response = match client.head(&url).timeout(Duration::from_secs(5)).send().await {
         Ok(response) => response,
         Err(err) => {
-            eprintln!("Error: timed out or connection closed"); // 超时或远程服务器关闭连接，也有可能其他错误
+            eprintln!("{}:{} Error: timed out or connection closed",ip, port); // 超时或远程服务器关闭连接，也有可能其他错误
             return Err(err.into());
         }
     };
