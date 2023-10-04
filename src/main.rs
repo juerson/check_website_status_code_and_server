@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 				// 将任务结果发送到通道
 				let send_result = sender_clone.send(result.map_err(|e| e.to_string())).await;
-				// 如果要在main函数中，要接收结果并使用它们，就必须添加下面这个处理发送操作的的代码。
+				// 如果要在main函数中，要接收结果并使用它们，就必须添加下面这个用于处理"发送失败"时的代码。
 				if let Err(_err) = send_result {
 					// eprintln!("Failed to send result: {:?}", err);
 				}
