@@ -2,4 +2,4 @@
 
 程序运行截图如下：
 
-![](images\截图1.png)
+<img src="images\截图1.png" />
