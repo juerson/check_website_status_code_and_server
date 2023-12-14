@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use csv::Writer;
 use std::fmt;
 use std::error::Error;
+use chrono::Local;
 
 //下面代码（一个struct、两个impl），主要用于处理无法在main函数中处理tcp_client_hello函数返回来的结果的问题
 #[derive(Debug)]
@@ -77,29 +78,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	
 	// 创建CSV写入器
 	let mut writer = Writer::from_path("output.csv")?;
-	writer.write_record(&["IP", "PORT", "Response Time(ms)", "Server"])?; // 首先写入CSV的标题
+	writer.write_record(&["IP", "PORT", "Response Time(ms)", "Status Code", "Server"])?; // 首先写入CSV的标题
 	// 接收任务结果并处理
 	while let Ok(result) = receiver.try_recv() {
 		match result {
 			Ok(response) => {
-				
-				// 打印处理成功的响应
-				println!("Received response: {:?}", response);
-
 				// 将结果写入CSV文件
 				writer.serialize(&response)?;
 			}
 			Err(_error) => {
 				// 处理错误信息
-				// eprintln!("Error: {}", error);
 			}
 		}
 	}
 
 	// 关闭CSV写入器
 	writer.flush()?;
-	println!("");
-	wait_for_enter(); // 等待用户按Enter键才退出窗口
+	wait_for_enter(); // 等待用户按Enter键退出窗口
     Ok(())
 }
 
@@ -165,15 +160,17 @@ fn generate_ipv4_ips_from_cidr(cidr: &str) -> Result<Vec<String>, Box<dyn std::e
     }
 }
 
-async fn tcp_client_hello(ip: String, port: u16) -> Result<(String, u16, String, String), CustomError> {
+async fn tcp_client_hello(ip: String, port: u16) -> Result<(String, u16, String, u16, String), CustomError> {
     let start_time = Instant::now();
     let url = format!("http://{}:{}", ip, port);
 
     let client = reqwest::Client::new();
     let response = match client.head(&url).timeout(Duration::from_secs(5)).send().await {
         Ok(response) => response,
-        Err(err) => {
-            eprintln!("{}:{} Error: timed out or connection closed",ip, port); // 超时或远程服务器关闭连接，也有可能其他错误
+        Err(err) => {// 超时或远程服务器关闭连接，也有可能其他错误
+			// 获取当前的日期和时间
+			let formatted_time = get_formatted_time();
+            println!("{} SCANNER {}:{} INFO Response time：Timeout, Stats Code：503, Server：Service Unavailable", formatted_time, ip, port);
             return Err(err.into());
         }
     };
@@ -187,21 +184,34 @@ async fn tcp_client_hello(ip: String, port: u16) -> Result<(String, u16, String,
 
 	// 使用条件语句根据条件设置server变量的值
 	let server = if !server_header.is_empty() {
-		format!("{} {}",status_code,server_header)
+		format!("{}",server_header)
 	}  else {
-		format!("{} No Server parameter",status_code)
+		format!("No Server parameter")
 	};
+	
+    // 获取当前的日期和时间
+    let formatted_time = get_formatted_time();
+	println!("{} SCANNER {}:{} INFO Response time：{} ms, Stats Code：{}, Server：{}", formatted_time, ip, port, elapsed_time_str, status_code, server);
 
-    println!("{}:{} {}ms {}", ip, port, elapsed_time_str, server);
-
-    Ok((ip, port, elapsed_time_str, server))
+    Ok((ip, port, elapsed_time_str, status_code, server))
 }
 
 
 fn wait_for_enter() {
-    print!("Press Enter to exit...");
+    print!("按Enter键退出程序...");
     io::stdout().flush().expect("Failed to flush stdout");
 
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Failed to read line");
+}
+
+fn get_formatted_time() -> String {
+    // 获取当前时间
+    let current_time = Local::now();
+
+    // 格式化输出日期和时间
+    let formatted_time = current_time.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // 返回结果
+    formatted_time
 }
