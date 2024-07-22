@@ -2,19 +2,29 @@
 name = "check_website_status_code_and_server"
 version = "0.1.0"
 edition = "2021"
-rustc-version = "1.75.0" # 测试时所用的rust版本
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[source.crates-io]
+replace-with = 'ustc'
+
+# 中国科学技术大学
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = "0.11.21"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 ipnetwork = "0.20.0"
 csv = "1.3.0"
-chrono = "0.4.31"
-lazy_static = "1.4.0"
+chrono = "0.4.38"
 rand = "0.8.5"
-url = "2.5.0"
+url = "2.5.2"
+ipnet = "2.9.0"
+futures = "0.3.30"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+
+# [[bin]]
+# name = "app1"
+# path = "test/read_json.rs"

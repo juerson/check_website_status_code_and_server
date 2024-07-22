@@ -1,356 +1,214 @@
-use chrono::Local;
+mod utils;
+
+use crate::utils::{
+    common::{
+        append_or_create_and_write, delete_if_file_exists, wait_for_enter, write_to_txt_file,
+    },
+    data::{determine_ipaddress_type, get_data_from_file},
+    http_request::{acquire_semaphore, is_curl_installed, run_curl},
+    locations::{check_and_download_location_file, load_location_file},
+};
 use csv::Writer;
-use ipnetwork::IpNetwork;
-use lazy_static::lazy_static;
+use futures::future::join_all;
 use rand::seq::SliceRandom;
-use reqwest::{header::HeaderMap, Client};
-use std::{
-    error::Error,
-    fmt,
-    fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
-    net::IpAddr,
-    str::FromStr,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
-use tokio::{
-    sync::{mpsc, Semaphore, SemaphorePermit},
-    time::{sleep, Duration},
-};
-use url::Url;
+use std::{fs::File, sync::Arc, time::Instant};
+use tokio::sync::{mpsc, Semaphore};
 
-lazy_static! {
-    // 存放server为cloudflare的IP的文件
-    static ref IS_CLOUDFLARE_SERVER_FILE: Mutex<String> = Mutex::new("ip.txt".to_string());
-}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /* 涉及的相关文件 */
+    let data_file: &str = "ips-v4.txt";
+    let output_file: &str = "output.csv";
+    let is_cloudflare_file: &str = "is_cloudflare.txt";
+    let is_jetbrains_license_server_file = "is_jetbrains_license_server.txt";
+    let location_file = "locations.json";
+    let location_url = "https://speed.cloudflare.com/locations";
 
-//下面代码（一个struct、两个impl），主要用于处理无法在main函数中处理tcp_client_hello函数返回来的结果的问题
-#[derive(Debug)]
-struct CustomError(Box<dyn Error + Send>);
+    // ——————————————————————— 检查curl工具是否安装；检查locations.json文件是否存在，不存在就下载 ———————————————————————
 
-impl From<reqwest::Error> for CustomError {
-    fn from(err: reqwest::Error) -> Self {
-        CustomError(Box::new(err))
-    }
-}
-
-impl fmt::Display for CustomError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 自定义错误消息的格式
-        write!(f, "CustomError: {}", self.0)
-    }
-}
-
-/* 读取文件的文件，并解析IP地址 */
-fn read_and_parse_ips_from_file(filename: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let file = File::open(filename);
-    let file_result = file.unwrap_or_else(|err| {
-        // 处理文件不存在的错误
-        eprintln!("打开{}文件，报错: {}", filename, err);
-        wait_for_enter();
-        std::process::exit(1); // 终止程序
-    });
-    let reader = BufReader::new(file_result);
-    let mut unique_ips = std::collections::HashSet::new();
-
-    for line in reader.lines() {
-        if let Ok(ip_str) = line {
-            let ip_type = determine_ip_type(&ip_str);
-            if ip_type == "IPv4 CIDR" {
-                let ips_from_cidr = generate_ipv4_ips_from_cidr(&ip_str)?;
-                unique_ips.extend(ips_from_cidr);
-            } else if ip_type == "IPv4" {
-                unique_ips.insert(ip_str);
-            } else if ip_type == "Domain Name" {
-                unique_ips.insert(ip_str);
-            } // IPv6 和 IPv6 CIDR 的省略
-        }
+    // 检查电脑是否安装有curl，没有安装就退出程序
+    if !is_curl_installed().await {
+        println!("本电脑未安装curl命令工具");
+        return Ok(());
     }
 
-    let ips: Vec<String> = unique_ips.into_iter().collect();
-    if ips.is_empty() {
-        eprintln!("文件'{}'不能为空.", filename);
+    // 下载locations.json文件
+    check_and_download_location_file(location_file, location_url).await?;
+
+    // ——————————————————————————————— 读取ips-v4.txt文件中的数据，并选择性生成IPv4地址 ————————————————————————————————
+
+    let mut addresses: Vec<String> = get_data_from_file(data_file)?;
+
+    // 使用 SliceRandom trait 中的 shuffle 方法打乱向量
+    let mut rng = rand::thread_rng();
+    addresses.shuffle(&mut rng);
+
+    // 没有数据，就退出程序
+    if addresses.len() == 0 {
+        println!("没有读取到任何数据，请检查{}文件内容", data_file);
         wait_for_enter();
         std::process::exit(1);
     }
 
-    Ok(ips)
-}
+    let ports: Vec<u16> = vec![80]; // 这里可以修改为其它端口，或者添加更多的端口
 
-/* 确定IP的类型（IPv4/IPv6、IPv4 CIDR、IPv6 CIDR、域名） */
-fn determine_ip_type(address: &str) -> &str {
-    if let Ok(ip_address) = IpAddr::from_str(address) {
-        match ip_address {
-            IpAddr::V4(_) => "IPv4",
-            IpAddr::V6(_) => "IPv6",
-        }
-    } else if let Ok(ip_network) = address.parse::<IpNetwork>() {
-        match ip_network {
-            IpNetwork::V4(_) => "IPv4 CIDR",
-            IpNetwork::V6(_) => "IPv6 CIDR",
-        }
-    } else {
-        let address_to_parse =
-            if !address.starts_with("http://") && !address.starts_with("https://") {
-                format!("http://{}", address)
-            } else {
-                address.to_string()
-            };
+    // ————————————————————————————————————————————— 并发执行run_curl函数 —————————————————————————————————————————————
 
-        if let Ok(url) = Url::parse(&address_to_parse) {
-            if url.host_str().is_some() {
-                "Domain Name"
-            } else {
-                ""
-            }
-        } else {
-            ""
-        }
-    }
-}
+    // 限制并发的数量
+    let concurrent_limit: usize = 100;
 
-/* 生成IPv4地址 */
-fn generate_ipv4_ips_from_cidr(cidr: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if let Ok(ip_network) = cidr.parse::<IpNetwork>() {
-        let ips: Vec<String> = ip_network.iter().map(|ip| ip.to_string()).collect();
-        Ok(ips)
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-/* 判断HTTP headers的信息(Server) */
-fn get_server_header(headers: &HeaderMap) -> String {
-    headers
-        .get("Server")
-        .map_or("", |s| s.to_str().unwrap_or(""))
-        .to_lowercase()
-}
-
-/* 辅助函数 */
-fn wait_for_enter() {
-    print!("按Enter键退出程序>> ");
-    io::stdout().flush().expect("Failed to flush stdout");
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read line");
-}
-
-/* 获取当前时间 */
-fn get_formatted_time() -> String {
-    let current_time = Local::now();
-    let formatted_time = current_time.format("%Y/%m/%d %H:%M:%S").to_string();
-    formatted_time
-}
-
-/* 清空文件中的内容 */
-fn clear_file_content() {
-    let mut file = OpenOptions::new()
-        .create(true) // 如果文件不存在，创建新文件
-        .write(true) // 可写入文件
-        .truncate(true) // 截断文件，即清空文件内容
-        .open(IS_CLOUDFLARE_SERVER_FILE.lock().unwrap().as_str())
-        .expect("Failed to open file for truncation");
-
-    // 清空文件内容
-    if let Err(err) = file.set_len(0) {
-        eprintln!("清空文件内容失败: {:?}", err);
-    }
-
-    // 立即刷新文件
-    if let Err(err) = file.flush() {
-        eprintln!("刷新文件失败: {:?}", err);
-    }
-}
-
-/* 写入txt文件中 */
-fn write_to_file(ip: &str) -> Result<(), CustomError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(IS_CLOUDFLARE_SERVER_FILE.lock().unwrap().as_str())
-        .map_err(|e| CustomError(Box::new(e)))?;
-
-    writeln!(file, "{}", ip).map_err(|e| CustomError(Box::new(e)))?;
-
-    // 立即刷新文件
-    file.flush().map_err(|e| CustomError(Box::new(e)))?;
-
-    Ok(())
-}
-
-// 异步地从一个信号量中获取一个许可证（permit），如果获取失败，就会产生一个panic
-async fn acquire_semaphore(semaphore: &Arc<Semaphore>) -> SemaphorePermit {
-    semaphore.acquire().await.expect("Semaphore acquire failed")
-}
-
-/* 获取请求头的server信息 */
-async fn tcp_client_hello(
-    ip: String,
-    port: u16,
-) -> Result<(String, u16, String, u16, String), CustomError> {
-    const MAX_RETRIES: usize = 3;
-    let mut retry_count = 0;
-    let ip_type = determine_ip_type(ip.as_str());
-    let url = format!(
-        "http://{}{}",
-        ip,
-        if ip_type == "Domain Name" {
-            "".to_owned()
-        } else {
-            format!(":{}", port)
-        }
-    );
-    let print_address = if ip_type == "Domain Name" {
-        ip.clone()
-    } else {
-        format!("{}:{}", ip, port)
-    };
-    let client = Client::new();
-
-    loop {
-        let start_time = Instant::now();
-        match client
-            .head(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let elapsed_time = start_time.elapsed().as_millis();
-                let elapsed_time_str = format!("{:.2}", elapsed_time);
-                // 获取server值和HTTP状态码
-                let server_header = get_server_header(&response.headers());
-                let status_code = response.status().as_u16();
-                // 获取当前电脑的时间
-                let formatted_time = get_formatted_time();
-                println!(
-                    "{} {} -> 响应时间：{} ms, 状态码：{}, Server：{}",
-                    formatted_time, print_address, elapsed_time_str, status_code, server_header
-                );
-
-                return Ok((ip, port, elapsed_time_str, status_code, server_header));
-            }
-            Err(err) => {
-                // 超时或远程服务器关闭连接，也有可能其他错误
-                retry_count += 1;
-                if retry_count >= MAX_RETRIES {
-                    let formatted_time = get_formatted_time();
-                    println!(
-                        "{} {} -> 当前连接超时/其它错误，重试次数：已达到{}次上限！",
-                        formatted_time, print_address, retry_count
-                    );
-                    return Err(err.into());
-                } else {
-                    let formatted_time = get_formatted_time();
-                    println!(
-                        "{} {} -> 当前连接超时/其它错误，重试次数：{} 次！",
-                        formatted_time, print_address, retry_count
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
-
-    let filename = "ips-v4.txt";
-    let mut ips = read_and_parse_ips_from_file(filename)?;
-    // 清空IS_CLOUDFLARE_SERVER_FILE文件中原来的内容(存放server为cloudflare的IP的文件)
-    clear_file_content();
-
-    // 使用 SliceRandom trait 中的 shuffle 方法打乱向量
-    let mut rng = rand::thread_rng();
-    ips.shuffle(&mut rng);
-
-    let ports = vec![443]; // 这里可以添加更多的端口
-    let concurrent_limit = 500; // 限制并发的数量，可以适当修改这个数值
-
-    let semaphore = Arc::new(Semaphore::new(concurrent_limit));
     // 创建通道，receiver用于接收任务结果
-    let (sender, mut receiver) = mpsc::channel(ips.len() * ports.len());
-    let mut handles = Vec::new();
+    let (sender, mut receiver) = mpsc::channel(addresses.len() * ports.len());
 
-    for ip in &ips {
+    let semaphore: Arc<Semaphore> = Arc::new(Semaphore::new(concurrent_limit));
+    let mut tasks = Vec::new();
+
+    let data_center_locations: Vec<utils::locations::DataCenterLocations> =
+        load_location_file(location_file)?;
+
+    let start_time: Instant = Instant::now();
+
+    for address in &addresses {
         for port in &ports {
             let semaphore_permit = Arc::clone(&semaphore);
-            let ip_clone = ip.clone();
-            let port_clone = *port;
+            let address_clone: String = address.clone();
+            let port_clone: u16 = *port;
             let sender_clone = sender.clone();
-            let handle = tokio::spawn(async move {
+            let data_center_locations_clone = data_center_locations.clone();
+            let task = tokio::spawn(async move {
                 let permit = acquire_semaphore(&semaphore_permit).await;
-                let result = tcp_client_hello(ip_clone, port_clone).await;
+                let result = run_curl(address_clone, port_clone, data_center_locations_clone).await;
                 drop(permit);
                 // 将任务结果发送到通道
                 let send_result = sender_clone.send(result.map_err(|e| e.to_string())).await;
                 // 用于处理"发送失败"
-                if let Err(_err) = send_result {
-                    // eprintln!("Failed to send result: {:?}", err);
+                if let Err(err) = send_result {
+                    eprintln!("Failed to send result: {:?}", err);
                 }
             });
-            handles.push(handle);
+            tasks.push(task);
         }
     }
+
     // 等待所有任务完成
-    for handle in handles {
-        let _ = handle.await;
-    }
+    join_all(tasks).await;
+
+    // 关闭发送通道
+    drop(sender);
+
+    // ———————————————————————————————————— 处理receiver结果，并将结果写入csv文件中 ————————————————————————————————————
 
     /* 将结果写入文件中 */
-    // 创建CSV写入器
-    let mut writer = Writer::from_path("output.csv")?;
-    // 首先写入CSV的标题
-    writer.write_record(&["IP", "PORT", "Response Time(ms)", "Status Code", "Server"])?;
+    let mut csv_writer_file: Writer<File> = Writer::from_path(output_file)?;
 
-    // 存放IP地址和域名
-    let mut ip_addresses: Vec<String> = Vec::new();
-    let mut domain_names: Vec<String> = Vec::new();
+    // 首先写入CSV的标题
+    csv_writer_file.write_record(&[
+        "网络地址",
+        "响应时间(ms)",
+        "HTTP状态码",
+        "数据中心",
+        "国家代码",
+        "服务器环境",
+    ])?;
+
+    // 存放IP地址、域名、是jetbrains激活服务器的地址
+    let mut ip_addresses_vec: Vec<String> = Vec::new();
+    let mut domain_addresses_vec: Vec<String> = Vec::new();
+    let mut jetbrains_license_server_vec: Vec<String> = Vec::new();
+
+    // 用于标记是否在最后写入说明字符串
+    let mut flag = false;
+
     // 接收任务结果并处理
     while let Ok(result) = receiver.try_recv() {
         match result {
             Ok(response) => {
-                let (ref ip, _port, ref _response_time, _status_code, ref server) = response;
-                writer.serialize(&response)?;
-                writer.flush()?;
+                let (
+                    address,
+                    port,
+                    response_time,
+                    http_status_code,
+                    cf_ray_code,
+                    country_code,
+                    server_env,
+                    jetbrains_license_server,
+                ) = response;
+                // 剔除不要的数据
+                if http_status_code != 0 {
+                    let ipaddress_type = determine_ipaddress_type(address.as_str());
+                    let is_cloudflare = server_env.to_lowercase().contains("cloudflare");
+                    let is_jetbrains_license =
+                        jetbrains_license_server.to_lowercase().contains("true");
+                    match ipaddress_type {
+                        "Domain Name" => {
+                            if is_cloudflare {
+                                domain_addresses_vec.push(address.clone());
+                            }
 
-                /* 下面将server为cloudflare的IP单独处理 */
-                if server.to_lowercase() == "cloudflare" {
-                    let ip_type = determine_ip_type(ip.as_str());
-                    if ip_type == "Domain Name" {
-                        domain_names.push(ip.clone());
-                    } else {
-                        ip_addresses.push(ip.clone());
+                            if is_jetbrains_license {
+                                jetbrains_license_server_vec.push(address.clone());
+                            }
+                            // port = 443;
+                        }
+                        _ => {
+                            if is_cloudflare {
+                                ip_addresses_vec.push(address.clone());
+                            }
+                            if is_jetbrains_license {
+                                let jetbrain_license_address = format!("{}:{}", address, port);
+                                jetbrains_license_server_vec.push(jetbrain_license_address);
+                            }
+                        }
                     }
+                    flag = true;
+                    csv_writer_file.serialize([
+                        address,
+                        response_time,
+                        http_status_code.to_string(),
+                        cf_ray_code,
+                        country_code,
+                        server_env,
+                    ])?;
+                    csv_writer_file.flush()?;
                 }
             }
-            Err(_error) => {}
+            Err(_) => {}
         }
     }
 
-    // 合并两个向量，IP在前，域名在后
-    ip_addresses.extend(domain_names);
-
-    // 写入TXT文件（将server为cloudflare的IP地址添加到txt文件中，IP地址再前面，域名在后面）
-    for ip in ip_addresses {
-        if let Err(err) = write_to_file(&ip) {
-            if let Some(file_path) = IS_CLOUDFLARE_SERVER_FILE.lock().ok() {
-                eprintln!("写入'{}'文件失败: {:?}", file_path, err);
-            } else {
-                // eprintln!("Failed to acquire lock for IS_CLOUDFLARE_SERVER_FILE: {:?}", err);
-            }
-        }
+    // 在后面插入一行，用于说明已经剔除无效数据（可以省略）
+    if flag {
+        csv_writer_file.serialize(["", "", "", "", "", "注意：已经剔除无效数据"])?;
+        csv_writer_file.flush()?;
     }
 
-    println!("\n注意：如果扫描的目标是域名，则忽略端口。");
-    println!(
-        "任务执行完毕，耗时：{:?}；程序在3秒后自动退出！",
-        start_time.elapsed()
-    );
-    sleep(tokio::time::Duration::from_secs(3)).await;
-    Ok(())
+    // —————————————————————— 分别将cloudflare和jetbrains_license_server相关的地址写入不同的txt文件中 ———————————————————
+
+    // 合并两个向量，域名在前面，IP地址在后面
+    domain_addresses_vec.extend(ip_addresses_vec);
+
+    // 转换为字符串
+    let cloudflare_content: String = domain_addresses_vec.join("\n");
+    let license_server_content: String = jetbrains_license_server_vec.join("\n") + "\n"; // 结尾换行
+
+    // 将Server为cloudflare的地址，写入txt文件中
+    if !cloudflare_content.trim().is_empty() {
+        write_to_txt_file(cloudflare_content, is_cloudflare_file);
+    } else {
+        delete_if_file_exists(is_cloudflare_file)?;
+    }
+
+    // 是Jetbrains的激活服务器的，追加写入txt文件中
+    if !license_server_content.trim().is_empty() {
+        append_or_create_and_write(&license_server_content, is_jetbrains_license_server_file)?;
+    }
+
+    // ———————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+    println!("\n注意：如果扫描的目标是域名地址，则不需要添加端口。");
+    println!("所有任务执行完毕，耗时：{:?}", start_time.elapsed());
+
+    // 关闭接收通道
+    drop(receiver);
+    std::process::exit(0);
 }
